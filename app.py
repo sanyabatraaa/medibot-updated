@@ -1,72 +1,112 @@
-from flask import Flask, render_template, jsonify, request
+import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage
 from src.helper import download_hugging_face_embeddings
 from langchain_pinecone import PineconeVectorStore
 import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+import numpy as np
 
-app = Flask(__name__)
+# Load your X-ray model
+xray_model = load_model("xray_best_model.h5")
+
+
+
+# Load environment variables
 load_dotenv()
-
 PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
-
-
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# Configure Gemini API
-genai.configure(api_key="AIzaSyDu4wr0U2RyJxHxPHBSNtKgXkoMyRu9ROc")
-
-# Load embeddings and create Pinecone retriever
+# Initialize embedding model and retriever
 embeddings = download_hugging_face_embeddings()
-index_name = "llmapp"
-
 docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
+    index_name="llmapp",
     embedding=embeddings
 )
-
 retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
-def generate_gemini_response(prompt):
+# Session state for memory
+if "chat_memory" not in st.session_state:
+    st.session_state.chat_memory = []
+
+# Gemini response generator
+def generate_gemini_response(context, question):
     try:
-        model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        history_prompt = ""
+        for msg in st.session_state.chat_memory:
+            if isinstance(msg, HumanMessage):
+                history_prompt += f"User: {msg.content}\n"
+            elif isinstance(msg, AIMessage):
+                history_prompt += f"Bot: {msg.content}\n"
+
+        prompt = f"{history_prompt}Context: {context}\nUser: {question}\nBot:"
+        model = genai.GenerativeModel("gemini-2.0-flash")
         response = model.generate_content(prompt)
-        
-        # Extract text response safely
+
         if response and response.candidates:
-            return response.candidates[0].content.parts[0].text
+            reply = response.candidates[0].content.parts[0].text
         else:
-            return "I'm sorry, but I couldn't generate a response."
-    
+            reply = "I'm sorry, I couldn't generate a response."
+
+        # Update memory
+        st.session_state.chat_memory.append(HumanMessage(content=question))
+        st.session_state.chat_memory.append(AIMessage(content=reply))
+
+        return reply
     except Exception as e:
-        print("Gemini API Error:", str(e))
-        return "There was an issue generating a response."
+        print("Gemini Error:", e)
+        return "There was an error generating the response."
 
-@app.route("/")
-def index():
-    return render_template("index.html")
 
-@app.route("/get", methods=["GET", "POST"])
-def chat():
-    msg = request.form.get("msg", "")
-    
-    if not msg.strip():
-        return "Please enter a valid query."
+# Streamlit Layout
+st.set_page_config(page_title="MediBot", layout="wide")
+st.title("💬 MediBot - Medical Chatbot")
 
-    print("User Input:", msg)
+st.subheader("📤 Upload Chest X-ray for Diagnosis")
+uploaded_file = st.file_uploader("Upload a chest X-ray image", type=["jpg", "jpeg", "png"])
 
-    retrieved_docs = retriever.get_relevant_documents(msg)
-    
-    if retrieved_docs:
-        context = " ".join([doc.page_content for doc in retrieved_docs])
-        full_prompt = f"Context: {context}\n\nUser Query: {msg}\n\nAnswer:"
-    else:
-        full_prompt = f"User Query: {msg}\n\nAnswer:"
+if uploaded_file is not None:
+    img = image.load_img(uploaded_file, target_size=(224, 224))
+    img_array = image.img_to_array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-    response = generate_gemini_response(full_prompt)
+    prediction = xray_model.predict(img_array)[0][0]
+    diagnosis = "PNEUMONIA" if prediction > 0.5 else "NORMAL"
+    confidence = prediction if prediction > 0.5 else 1 - prediction
 
-    print("Response:", response)
-    return response
+    st.image(img, caption="Uploaded X-ray", use_column_width=True)
+    st.markdown(f"### 🩻 Diagnosis: **{diagnosis}**")
+    st.markdown(f"Confidence: `{confidence:.2%}`")
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8080, debug=True)
+
+
+# Chat form 
+with st.form(key="chat_form", clear_on_submit=True):
+    user_input = st.text_input("Ask MediBot a question:", "")
+    submit_button = st.form_submit_button(label="Send")
+
+# Handle submission
+if submit_button and user_input:
+    # Retrieve relevant documents
+    retrieved_docs = retriever.get_relevant_documents(user_input)
+    context = " ".join([doc.page_content for doc in retrieved_docs]) if retrieved_docs else ""
+
+    # Generate Gemini response
+    response = generate_gemini_response(context=context, question=user_input)
+
+    # Show chat
+    st.markdown(f"**🧑 You:** {user_input}")
+    st.markdown(f"**🤖 MediBot:** {response}")
+
+# Sidebar chat memory (should come last so memory is up-to-date)
+st.sidebar.header("🧠 Conversation Memory")
+if st.session_state.chat_memory:
+    for msg in st.session_state.chat_memory:
+        role = "User" if isinstance(msg, HumanMessage) else "Bot"
+        st.sidebar.markdown(f"**{role}:** {msg.content}")
+else:
+    st.sidebar.write("No memory yet.")
